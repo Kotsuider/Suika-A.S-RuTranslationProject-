@@ -1,0 +1,50 @@
+{
+  "injector": {
+    "enable": true,
+    "target_module": "BGI.exe",
+    "print_loaded_modules": true
+  },
+  
+    "allocate_console": false,
+	
+	"file_monitor": {
+    "enable": true,
+    "log_all": false,
+    "actions": [
+      {
+        "pattern": "^.*[\\\\/]([a-zA-Z0-9_]+)$",
+        "redirect": "patch/$1"
+      }
+     ]
+    },
+
+    "character_substitution": {
+      "enable": true,
+      "source_characters": "><+-=#",
+      "target_characters": "ÓÕ¹²×É"
+    },
+
+    "font_manager": {
+      "enable": true,
+      "resource_files": [
+        "YasuSakuutaModern.ttf"
+      ],
+      "spoof_enumeration": {
+        "enable": true,
+        "filter_pitch_and_family": 1,
+        "filter_charset": 1,
+        "spoof_charset": 128
+      },
+      "spoof_creation": {
+        "enable": true,
+        "override_face": "YasuSakuutaModern",
+        "override_charset": 0
+      }
+    },
+
+    "window_manager": {
+    "enable": true,
+    "overwrite_title": "Suika A.S+",
+    "process_existing_windows": true
+  }
+}
