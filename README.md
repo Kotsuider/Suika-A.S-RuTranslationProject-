@@ -16,7 +16,7 @@
 - [ ] Полный перевод
 - [ ] Редактура
 
-[Таблица с переводом](https://docs.google.com/spreadsheets/d/1uj5MKzgCKL6DsePytshkUoymAN5QBM8K/edit?usp=sharing&ouid=103224880279791937700&rtpof=true&sd=true) 
+[Таблица с переводом](https://docs.google.com/spreadsheets/d/1ys3aVklQtuviDvpHG_Xnj22VTMZUeDSb/edit?usp=sharing&ouid=103224880279791937700&rtpof=true&sd=true) 
 
 
 ## Установка

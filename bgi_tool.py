@@ -213,6 +213,9 @@ _RU_F_CYR_TO_BYTES.update({
     'Ё': b'<',               # U+00D5
     'Э': b'=',               # U+00D7
     'Й': b'J',    'й': b'j',   # U+012C не в cp1252, используем J/j
+    '-': b'#',
+    '«': b'"',
+    '»': b'"',
 })
 
 
@@ -378,6 +381,16 @@ def _extract_v1(data: bytes, code_offset: int) -> tuple[list[ScriptString], int]
             for item in reversed(choices):
                 strings.append(ScriptString(item[0], item[1], "message"))
 
+        elif op == 0x0009:          # operand follows
+            operand = struct.unpack_from("<I", data, pos)[0]; pos += 4
+            if operand == 2 and stack:
+                # display choice item: push_str → op_0009(2) → op_007f
+                # the string on the stack is a choice option
+                op_off, addr = stack.pop()
+                stype = "message" if not is_empty(addr) else "internal"
+                strings.append(ScriptString(op_off, addr, stype))
+            # otherwise leave stack as-is
+
         elif op in V1_FLUSH_OPS:    # flush stack → internal, then read own operands
             flush_as_internal()
             pos += 4 * len(_V1_WITH_OPS.get(op, ""))
@@ -466,9 +479,9 @@ def patch_script(data:         bytes,
 # Excel writing
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Колонки: A=# B=Type C=Original D=TL E=TLE F=Offset(hex)
-_COL_HEADERS = ["#", "Type", "Original", "TL", "TLE", "Offset (hex)"]
-_COL_WIDTHS  = [5,   9,       65,          65,   65,    14]
+# Колонки: A=# B=Type C=Original D=TL E=TLE F=Sfx G=Offset(hex)
+_COL_HEADERS = ["#", "Type", "Original", "TL", "TLE", "Sfx", "Offset (hex)"]
+_COL_WIDTHS  = [5,   9,       65,          65,   65,    5,     14]
 _HDR_BG, _HDR_FG = "2F5496", "FFFFFF"
 _MSG_BG, _NAME_BG = "FFFFFF", "E2EFDA"
 _TL_BG  = "FFF2CC"   # жёлтый — колонка TL
@@ -504,13 +517,17 @@ def write_xlsx(files: dict[str, tuple[list[ScriptString], bytes, str]],
         for s in strings:
             if s.string_type == "internal":
                 continue
-            text = _read_sz(data, s.text_offset, encoding)
+            text = _read_sz(data, s.text_offset, encoding).replace("\n", "\\n")
+            sfx  = ""
+            if text.endswith("@"):
+                text = text[:-1]
+                sfx  = "@"
             row  = idx + 1
             bg   = _NAME_BG if s.string_type == "name" else _MSG_BG
 
-            # A=#  B=Type  C=Original  D=TL(пусто)  E=TLE(пусто)  F=Offset
-            row_vals = [idx, s.string_type.capitalize(), text, "", "", hex(s.operand_offset)]
-            row_bgs  = [bg,  bg,                         bg,   _TL_BG, _TLE_BG, bg]
+            # A=#  B=Type  C=Original  D=TL(пусто)  E=TLE(пусто)  F=Sfx  G=Offset
+            row_vals = [idx, s.string_type.capitalize(), text, "", "", sfx, hex(s.operand_offset)]
+            row_bgs  = [bg,  bg,                         bg,   _TL_BG, _TLE_BG, bg, bg]
 
             for col, (val, cell_bg) in enumerate(zip(row_vals, row_bgs), 1):
                 c = ws.cell(row=row, column=col, value=val)
@@ -532,7 +549,7 @@ def write_xlsx(files: dict[str, tuple[list[ScriptString], bytes, str]],
 def read_xlsx(xlsx_path: str) -> dict[str, dict[int, str]]:
     """
     Читает переводы из Excel.
-    Колонки: A=# B=Type C=Original D=TL E=TLE F=Offset(hex)
+    Колонки: A=# B=Type C=Original D=TL E=TLE F=Sfx G=Offset(hex)
     Приоритет: TLE (E) → TL (D) → пропустить (оставить оригинал).
     """
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
@@ -540,18 +557,20 @@ def read_xlsx(xlsx_path: str) -> dict[str, dict[int, str]]:
     for ws in wb.worksheets:
         sheet: dict[int, str] = {}
         for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or len(row) < 6:
+            if not row or len(row) < 7:
                 continue
-            # F=col6 → index 5
-            offset_val = row[5]
+            # G=col7 → index 6
+            offset_val = row[6]
             tl         = row[3]   # D
             tle        = row[4]   # E
+            sfx        = row[5]   # F
             if offset_val is None:
                 continue
             try:
                 offset = int(str(offset_val), 16)
             except ValueError:
                 continue
+            sfx_str = str(sfx).strip() if sfx is not None else ""
             # TLE имеет приоритет
             translation = None
             if tle is not None and str(tle).strip():
@@ -559,7 +578,7 @@ def read_xlsx(xlsx_path: str) -> dict[str, dict[int, str]]:
             elif tl is not None and str(tl).strip():
                 translation = str(tl)
             if translation is not None:
-                sheet[offset] = translation
+                sheet[offset] = translation.replace("\\n", "\n") + sfx_str
         result[ws.title] = sheet
     wb.close()
     return result
