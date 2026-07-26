@@ -15,6 +15,7 @@ Usage:
 """
 
 import os
+import re
 import struct
 import argparse
 from dataclasses import dataclass
@@ -179,6 +180,36 @@ def _encode_sz(text: str, encoding: str = "cp1252") -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Punctuation normalization (многоточие + ?/! → русская типографика)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# "...?" / "... ?" / "........!" / ".......?" и т.п. → "?..." / "!........"
+# Число точек СОХРАНЯЕТСЯ как в оригинале — знак просто переносится вперёд,
+# а разделяющий пробел/таб (если был) убирается.
+_RE_ELLIPSIS_MARK = re.compile(r"(\.{2,})[ \t]*([?!])\2*")
+
+# "!!" / "!!!!!!" → "!!!"   "??" / "??????" → "???"
+# (2 и более одинаковых знака подряд, без ведущего многоточия — оно уже съедено выше)
+_RE_REPEATED_MARK = re.compile(r"([!?])\1+")
+
+
+def _normalize_punctuation(text: str) -> str:
+    """Приводит '...?'/'... ?'/'!!'/'??' и т.д. к стандартному русскому виду.
+
+    Многоточие + ?/! → знак переносится в начало, количество точек не меняется:
+        "...?"       -> "?..."
+        "... !"      -> "!..."
+        "........!"  -> "!........"
+    Голые повторы одного знака (без точек) схлопываются в тройной:
+        "!!" / "!!!!!!" -> "!!!"
+        "??" / "??????" -> "???"
+    """
+    text = _RE_ELLIPSIS_MARK.sub(lambda m: m.group(2) + m.group(1), text)
+    text = _RE_REPEATED_MARK.sub(lambda m: m.group(1) * 3, text)
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Transliteration  (--RU_C / --RU_F)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -216,6 +247,7 @@ _RU_F_CYR_TO_BYTES.update({
     '-': b'#',
     '«': b'"',
     '»': b'"',
+    '*': b'*',
 })
 
 
@@ -578,7 +610,8 @@ def read_xlsx(xlsx_path: str) -> dict[str, dict[int, str]]:
             elif tl is not None and str(tl).strip():
                 translation = str(tl)
             if translation is not None:
-                sheet[offset] = translation.replace("\\n", "\n") + sfx_str
+                translation = _normalize_punctuation(translation.replace("\\n", "\n"))
+                sheet[offset] = translation + sfx_str
         result[ws.title] = sheet
     wb.close()
     return result
