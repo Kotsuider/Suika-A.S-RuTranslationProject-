@@ -12,12 +12,15 @@ Supported formats:
 Usage:
   Extract:  python bgi_tool.py extract file1 [file2 ...] -o output.xlsx
   Insert:   python bgi_tool.py insert  file1 [file2 ...] -x translations.xlsx -o out_dir/
+            python bgi_tool.py insert  file1 [file2 ...] -x translations.xlsx -o out_dir/ --wrapper monospace --line-width 48
 """
 
 import os
 import re
+import sys
 import struct
 import argparse
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import openpyxl
@@ -26,17 +29,204 @@ from openpyxl.utils import get_column_letter
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Word Wrapping
+# ─────────────────────────────────────────────────────────────────────────────
+
+LINE_BREAK_CHARS = (' ', '-')
+CJK_PUNCTUATION = "，。？！」』】）’”"
+
+
+class WordWrapper(ABC):
+    @abstractmethod
+    def get_text_width(self, text: str, offset: int, length: int) -> int:
+        pass
+
+    @property
+    @abstractmethod
+    def line_width(self) -> int:
+        pass
+
+    def get_wrap_positions(self, text: str) -> list[int]:
+        positions: list[int] = []
+        line_start_pos = 0
+        n = len(text)
+
+        while line_start_pos < n:
+            line_end_pos = line_start_pos
+            while line_end_pos < n:
+                search_pos = -1
+                for idx in range(line_end_pos + 1, n):
+                    if text[idx] in LINE_BREAK_CHARS:
+                        search_pos = idx
+                        break
+
+                if search_pos >= 0:
+                    if text[search_pos] != ' ':
+                        search_pos += 1
+                else:
+                    search_pos = n
+
+                if self.get_text_width(text, line_start_pos, search_pos - line_start_pos) > self.line_width:
+                    break
+
+                line_end_pos = search_pos
+
+            if line_end_pos == line_start_pos:
+                search_pos = line_end_pos
+                while line_end_pos < n:
+                    search_pos += 1
+                    if self.get_text_width(text, line_start_pos, search_pos - line_start_pos) > self.line_width:
+                        break
+                    line_end_pos = search_pos
+
+            if line_end_pos < n and text[line_end_pos] in CJK_PUNCTUATION:
+                line_end_pos += 1
+
+            positions.append(line_end_pos)
+
+            line_start_pos = line_end_pos
+            while line_start_pos < n and text[line_start_pos] == ' ':
+                line_start_pos += 1
+
+        return positions
+
+    def wrap(self, text: str, line_break: str = "\n") -> str:
+        result_lines: list[str] = []
+        raw_lines = text.replace("\r\n", "\n").split("\n")
+
+        for line in raw_lines:
+            line_start_pos = 0
+            wrap_positions = self.get_wrap_positions(line)
+            if not wrap_positions:
+                result_lines.append("")
+                continue
+
+            for line_end_pos in wrap_positions:
+                if line_end_pos == line_start_pos:
+                    continue
+                result_lines.append(line[line_start_pos:line_end_pos])
+                line_start_pos = line_end_pos
+                while line_start_pos < len(line) and line[line_start_pos] == ' ':
+                    line_start_pos += 1
+
+        return line_break.join(result_lines)
+
+
+class MonospaceWordWrapper(WordWrapper):
+    def __init__(self, characters_per_line: int = 50):
+        self._characters_per_line = characters_per_line
+
+    @property
+    def line_width(self) -> int:
+        return self._characters_per_line
+
+    def get_text_width(self, text: str, offset: int, length: int) -> int:
+        return max(0, length)
+
+
+class ProportionalWordWrapper(WordWrapper):
+    def __init__(self, font_name: str = "Franklin Gothic Book", font_size: int = 40, bold: bool = False, line_width: int = 1000):
+        self._font_name = font_name
+        self._font_size = font_size
+        self._bold = bold
+        self._line_width = line_width
+        self._char_widths: dict[str, int] = {}
+        self._kern_amounts: dict[tuple[str, str], int] = {}
+        self._init_font()
+
+    @property
+    def line_width(self) -> int:
+        return self._line_width
+
+    def _init_font(self):
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                user32 = ctypes.windll.user32
+                gdi32 = ctypes.windll.gdi32
+
+                dc = user32.GetDC(0)
+                FW_BOLD = 700
+                FW_NORMAL = 400
+                ANSI_CHARSET = 0
+                weight = FW_BOLD if self._bold else FW_NORMAL
+
+                hfont = gdi32.CreateFontW(
+                    self._font_size, 0, 0, 0, weight, 0, 0, 0,
+                    ANSI_CHARSET, 0, 0, 0, 0, self._font_name
+                )
+                gdi32.SelectObject(dc, hfont)
+
+                class ABCFLOAT(ctypes.Structure):
+                    _fields_ = [('abcfA', ctypes.c_float), ('abcfB', ctypes.c_float), ('abcfC', ctypes.c_float)]
+
+                class KERNINGPAIR(ctypes.Structure):
+                    _fields_ = [('wFirst', wintypes.WORD), ('wSecond', wintypes.WORD), ('iKernAmount', ctypes.c_int)]
+
+                abc_array = (ABCFLOAT * 256)()
+                if gdi32.GetCharABCWidthsFloatW(dc, 0, 255, abc_array):
+                    for i in range(256):
+                        w = int(abc_array[i].abcfA + abc_array[i].abcfB + abc_array[i].abcfC)
+                        self._char_widths[chr(i)] = max(0, w)
+
+                num_pairs = gdi32.GetKerningPairsW(dc, 0, None)
+                if num_pairs > 0:
+                    pairs_array = (KERNINGPAIR * num_pairs)()
+                    gdi32.GetKerningPairsW(dc, num_pairs, pairs_array)
+                    for pair in pairs_array:
+                        self._kern_amounts[(chr(pair.wFirst), chr(pair.wSecond))] = pair.iKernAmount
+
+                user32.ReleaseDC(0, dc)
+                gdi32.DeleteObject(hfont)
+            except Exception:
+                pass
+
+    def _get_char_width(self, c: str) -> int:
+        if c in self._char_widths:
+            return self._char_widths[c]
+        w = self._font_size if ord(c) > 0x2E80 else self._font_size // 2
+        self._char_widths[c] = w
+        return w
+
+    def _get_kern_amount(self, first: str, second: str) -> int:
+        return self._kern_amounts.get((first, second), 0)
+
+    def get_text_width(self, text: str, offset: int, length: int) -> int:
+        if length <= 0:
+            return 0
+        width = 0
+        for i in range(offset, offset + length):
+            width += self._get_char_width(text[i])
+            if i > offset:
+                width += self._get_kern_amount(text[i - 1], text[i])
+        return width
+
+
+class NoOpWordWrapper(WordWrapper):
+    @property
+    def line_width(self) -> int:
+        return 999999
+
+    def get_text_width(self, text: str, offset: int, length: int) -> int:
+        return 0
+
+    def wrap(self, text: str, line_break: str = "\r\n") -> str:
+        return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Opcode tables
 # ─────────────────────────────────────────────────────────────────────────────
 
 V1_MAGIC = b"BurikoCompiledScriptVer1.00\x00"
 
-# V1 opcodes that consume one or more int32 operands (others take 0)
 _V1_WITH_OPS: dict[int, str] = {
     0x0000: "i",    # push constant
     0x0001: "c",    # push code address
     0x0002: "i",    # push var address
-    0x0003: "m",    # push string address  ← text lives here
+    0x0003: "m",    # push string address
     0x0008: "i",
     0x0009: "i",
     0x000A: "i",
@@ -64,9 +254,6 @@ V1_ALL_OPS: set[int] = set(_V1_WITH_OPS.keys()) | _V1_NO_OPS
 V1_HALT_OPS  = {0x001B, 0x00F4}
 V1_FLUSH_OPS = {0x007E, 0x007F, 0x00FE}
 
-# V0 operand templates (uint16 opcode → template string)
-#   i=int32  h=int16  c=code-addr(int32)  m=msg-addr(int32)
-#   n=name-addr(int32)  z=inline null-terminated SJIS string
 V0_OPERAND_TEMPLATES: dict[int, str] = {
     0x0010: "iim", 0x0011: "",   0x0012: "zz",  0x0013: "z",   0x0014: "z",
     0x0015: "",    0x0018: "iiiii", 0x0019: "iiii", 0x001A: "iii",
@@ -126,7 +313,6 @@ V0_ALL_OPS = set(V0_OPERAND_TEMPLATES.keys()) | V0_SPECIAL_OPS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _count_valid_v1_ops(data: bytes, limit: int = 120) -> int:
-    """Count consecutive valid V1 instructions parseable from byte 0."""
     pos, count = 0, 0
     while pos + 4 <= len(data) and count < limit:
         op = struct.unpack_from("<I", data, pos)[0]
@@ -138,10 +324,8 @@ def _count_valid_v1_ops(data: bytes, limit: int = 120) -> int:
 
 
 def detect_format(data: bytes) -> str:
-    """Return 'v1', 'v1_noheader', or 'v0'."""
     if data[: len(V1_MAGIC)] == V1_MAGIC:
         return "v1"
-    # If 20+ consecutive valid V1 ops parse from byte 0 → V1-noheader
     if _count_valid_v1_ops(data) >= 20:
         return "v1_noheader"
     return "v0"
@@ -153,8 +337,8 @@ def detect_format(data: bytes) -> str:
 
 @dataclass
 class ScriptString:
-    operand_offset: int  # file offset of the int32 address operand
-    text_offset:    int  # absolute file offset of the string bytes
+    operand_offset: int
+    text_offset:    int
     string_type:    str  # 'message' | 'name' | 'internal'
 
 
@@ -175,35 +359,15 @@ def _read_sz(data: bytes, offset: int, encoding: str = "shift_jis") -> str:
     return raw.decode("latin-1", errors="replace")
 
 
-def _encode_sz(text: str, encoding: str = "cp1252") -> bytes:
-    return text.encode(encoding, errors="replace") + b"\x00"
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Punctuation normalization (многоточие + ?/! → русская типографика)
+# Punctuation normalization
 # ─────────────────────────────────────────────────────────────────────────────
 
-# "...?" / "... ?" / "........!" / ".......?" и т.п. → "?..." / "!........"
-# Число точек СОХРАНЯЕТСЯ как в оригинале — знак просто переносится вперёд,
-# а разделяющий пробел/таб (если был) убирается.
 _RE_ELLIPSIS_MARK = re.compile(r"(\.{2,})[ \t]*([?!])\2*")
-
-# "!!" / "!!!!!!" → "!!!"   "??" / "??????" → "???"
-# (2 и более одинаковых знака подряд, без ведущего многоточия — оно уже съедено выше)
 _RE_REPEATED_MARK = re.compile(r"([!?])\1+")
 
 
 def _normalize_punctuation(text: str) -> str:
-    """Приводит '...?'/'... ?'/'!!'/'??' и т.д. к стандартному русскому виду.
-
-    Многоточие + ?/! → знак переносится в начало, количество точек не меняется:
-        "...?"       -> "?..."
-        "... !"      -> "!..."
-        "........!"  -> "!........"
-    Голые повторы одного знака (без точек) схлопываются в тройной:
-        "!!" / "!!!!!!" -> "!!!"
-        "??" / "??????" -> "???"
-    """
     text = _RE_ELLIPSIS_MARK.sub(lambda m: m.group(2) + m.group(1), text)
     text = _RE_REPEATED_MARK.sub(lambda m: m.group(1) * 3, text)
     return text
@@ -213,7 +377,6 @@ def _normalize_punctuation(text: str) -> str:
 # Transliteration  (--RU_C / --RU_F)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# --RU_F: латиница A-Z → кириллица (заглавные)
 _RU_F_UPPER: dict[str, str] = {
     'A': 'А', 'B': 'Б', 'C': 'В', 'D': 'Г', 'E': 'Д', 'F': 'Е',
     'G': 'Ж', 'H': 'З', 'I': 'И', 'J': 'Й', 'K': 'К', 'L': 'Л',
@@ -223,28 +386,25 @@ _RU_F_UPPER: dict[str, str] = {
 }
 _RU_F_LOWER: dict[str, str] = {k.lower(): v.lower() for k, v in _RU_F_UPPER.items()}
 
-# Кириллица → байты для RU_F (то что реально пишется в файл)
 _RU_F_CYR_TO_BYTES: dict[str, bytes] = {}
 for _l, _c in _RU_F_UPPER.items():
     _RU_F_CYR_TO_BYTES[_c] = _l.encode('ascii')
 for _l, _c in _RU_F_LOWER.items():
     _RU_F_CYR_TO_BYTES[_c] = _l.encode('ascii')
 
-# Спецсимволы шрифта → их байты в cp1252
 _RU_F_CYR_TO_BYTES.update({
     'Ъ': b'[',    'Ь': b']',    'ё': b'`',
     'э': b'{',    'ы': b'|',    'я': b'}',
-    'Ы': b'\xa1',               # U+00A1
-    'ь': b'&',                  # U+0026
-    'ъ': b'+',               # U+00B9
-    'Ю': b'-',               # U+00B2
-    'ю': b'$',                  # U+0024
+    'Ы': b'\xa1',
+    'ь': b'&',
+    'ъ': b'+',
+    'Ю': b'%',
+    'ю': b'$',
     '—': b'#', 
-    'Я': b'>',               # U+00D3
-    'Ё': b'<',               # U+00D5
-    'Э': b'=',               # U+00D7
-    'Й': b'J',    'й': b'j',   # U+012C не в cp1252, используем J/j
-    '-': b'#',
+    'Я': b'>',
+    'Ё': b'<',
+    'Э': b'=',
+    'Й': b'J',    'й': b'j',
     '«': b'"',
     '»': b'"',
     '*': b'*',
@@ -252,7 +412,6 @@ _RU_F_CYR_TO_BYTES.update({
 
 
 def _apply_ru_f(text: str) -> bytes:
-    """Кириллический текст → байты специализированного шрифта (cp1252-based)."""
     out = bytearray()
     for ch in text:
         if ch in _RU_F_CYR_TO_BYTES:
@@ -266,12 +425,6 @@ def _apply_ru_f(text: str) -> bytes:
 
 
 def _encode_sz_mode(text: str, mode: str) -> bytes:
-    """
-    Кодирует строку согласно режиму вывода:
-      'direct' — cp1251, прямая кириллица      (--RU_C)
-      'font'   — байты спецшрифта cp1252-based  (--RU_F)
-      ''       — cp1252, оригинальный ASCII     (без флага)
-    """
     if mode == 'direct':
         return text.encode('cp1251', errors='replace') + b'\x00'
     if mode == 'font':
@@ -280,38 +433,25 @@ def _encode_sz_mode(text: str, mode: str) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# V0 extraction  (16-bit opcodes, SJIS)
+# V0 extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_v0(data: bytes) -> tuple[list[ScriptString], int]:
-    """Returns (strings, code_end_absolute)."""
     strings: list[ScriptString] = []
     pos = 0
     largest_code_addr = 0
 
     def r_u16() -> int:
-        nonlocal pos
-        v = struct.unpack_from("<H", data, pos)[0]; pos += 2; return v
-
+        nonlocal pos; v = struct.unpack_from("<H", data, pos)[0]; pos += 2; return v
     def r_i16() -> int:
-        nonlocal pos
-        v = struct.unpack_from("<h", data, pos)[0]; pos += 2; return v
-
+        nonlocal pos; v = struct.unpack_from("<h", data, pos)[0]; pos += 2; return v
     def r_i32() -> int:
-        nonlocal pos
-        v = struct.unpack_from("<i", data, pos)[0]; pos += 4; return v
-
+        nonlocal pos; v = struct.unpack_from("<i", data, pos)[0]; pos += 4; return v
     def skip_sz():
-        nonlocal pos
-        end = data.find(b"\x00", pos)
-        pos = (end + 1) if end != -1 else len(data)
-
+        nonlocal pos; end = data.find(b"\x00", pos); pos = (end + 1) if end != -1 else len(data)
     def read_code_addr():
         nonlocal pos, largest_code_addr
-        a = struct.unpack_from("<i", data, pos)[0]
-        largest_code_addr = max(largest_code_addr, a)
-        pos += 4
-
+        a = struct.unpack_from("<i", data, pos)[0]; largest_code_addr = max(largest_code_addr, a); pos += 4
     def read_str_addr(stype: str):
         nonlocal pos
         off = pos
@@ -337,14 +477,13 @@ def _extract_v0(data: bytes) -> tuple[list[ScriptString], int]:
         elif op in (0x00B0, 0x00B4):
             for _ in range(r_i32()): skip_sz()
         elif op == 0x00FD:
-            for _ in range(r_i32()):
-                skip_sz(); read_code_addr()
+            for _ in range(r_i32()): skip_sz(); read_code_addr()
         elif op == 0x0248:
-            pos = op_start; break   # not implemented — stop here
+            pos = op_start; break
         elif op in V0_OPERAND_TEMPLATES:
             apply_template(V0_OPERAND_TEMPLATES[op])
         else:
-            pos = op_start; break   # unknown opcode = end of code
+            pos = op_start; break
 
         if op == 0x00C2 and largest_code_addr < pos:
             break
@@ -353,15 +492,14 @@ def _extract_v0(data: bytes) -> tuple[list[ScriptString], int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# V1 extraction  (32-bit opcodes, separate string pool)
+# V1 extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_v1(data: bytes, code_offset: int) -> tuple[list[ScriptString], int]:
-    """Returns (strings, code_end_absolute)."""
     strings: list[ScriptString] = []
     pos = code_offset
     largest_code_addr = 0
-    stack: list[tuple[int, int]] = []   # (operand_offset, abs_text_offset)
+    stack: list[tuple[int, int]] = []
 
     def is_empty(abs_addr: int) -> bool:
         return abs_addr < len(data) and data[abs_addr] == 0
@@ -374,30 +512,25 @@ def _extract_v1(data: bytes, code_offset: int) -> tuple[list[ScriptString], int]
     while pos + 4 <= len(data):
         op = struct.unpack_from("<I", data, pos)[0]
         if op not in V1_ALL_OPS:
-            break   # hit string data or end of code
+            break
         pos += 4
 
-        # ── instructions that need special handling ──────────────────────────
-        if op == 0x0003:            # push string address
+        if op == 0x0003:
             op_off = pos
             addr   = struct.unpack_from("<I", data, pos)[0]; pos += 4
             stack.append((op_off, code_offset + addr))
-
-        elif op == 0x0001:          # push code address
+        elif op == 0x0001:
             a = struct.unpack_from("<I", data, pos)[0]; pos += 4
             largest_code_addr = max(largest_code_addr, code_offset + a)
-
-        elif op == 0x001C:          # call user function
+        elif op == 0x001C:
             if stack:
                 op_off, addr = stack.pop()
                 strings.append(ScriptString(op_off, addr, "internal"))
                 if _read_sz(data, addr) == "_SelectEx":
-                    # all remaining stack items are choice strings
                     choices, stack[:] = list(reversed(stack)), []
                     for item in reversed(choices):
                         strings.append(ScriptString(item[0], item[1], "message"))
-
-        elif op in (0x0140, 0x0143):    # show message
+        elif op in (0x0140, 0x0143):
             if stack:
                 m_off, m_addr = stack.pop()
                 m_type = "message" if not is_empty(m_addr) else "internal"
@@ -407,29 +540,21 @@ def _extract_v1(data: bytes, code_offset: int) -> tuple[list[ScriptString], int]
                     strings.append(ScriptString(n_off, n_addr, n_type))
                 strings.append(ScriptString(m_off, m_addr, m_type))
             flush_as_internal()
-
-        elif op == 0x0160:          # show choice screen
+        elif op == 0x0160:
             choices, stack[:] = list(reversed(stack)), []
             for item in reversed(choices):
                 strings.append(ScriptString(item[0], item[1], "message"))
-
-        elif op == 0x0009:          # operand follows
+        elif op == 0x0009:
             operand = struct.unpack_from("<I", data, pos)[0]; pos += 4
             if operand == 2 and stack:
-                # display choice item: push_str → op_0009(2) → op_007f
-                # the string on the stack is a choice option
                 op_off, addr = stack.pop()
                 stype = "message" if not is_empty(addr) else "internal"
                 strings.append(ScriptString(op_off, addr, stype))
-            # otherwise leave stack as-is
-
-        elif op in V1_FLUSH_OPS:    # flush stack → internal, then read own operands
+        elif op in V1_FLUSH_OPS:
             flush_as_internal()
             pos += 4 * len(_V1_WITH_OPS.get(op, ""))
-
         else:
             pos += 4 * len(_V1_WITH_OPS.get(op, ""))
-        # ────────────────────────────────────────────────────────────────────
 
         if op in V1_HALT_OPS and largest_code_addr < pos - code_offset:
             break
@@ -438,20 +563,8 @@ def _extract_v1(data: bytes, code_offset: int) -> tuple[list[ScriptString], int]
     return strings, pos
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
 def extract_strings(data: bytes) -> tuple[list[ScriptString], int, int, str]:
-    """
-    Returns (strings, code_offset, code_length, format_name).
-    strings      — all ScriptString objects (include 'internal' ones needed for patching)
-    code_offset  — byte offset where the code section begins
-    code_length  — length in bytes of the code section
-    format_name  — 'v0', 'v1', or 'v1_noheader'
-    """
     fmt = detect_format(data)
-
     if fmt == "v1":
         code_offset = len(V1_MAGIC) + struct.unpack_from("<I", data, len(V1_MAGIC))[0]
     else:
@@ -471,26 +584,32 @@ def extract_strings(data: bytes) -> tuple[list[ScriptString], int, int, str]:
 
 def patch_script(data:         bytes,
                  strings:      list[ScriptString],
-                 translations: dict[int, str],   # operand_offset → new text
+                 translations: dict[int, tuple[str, str]],
                  code_offset:  int,
                  code_length:  int,
-                 mode:         str = "") -> bytes:
-    """
-    Build patched file:
-      header (if any) + code (unchanged except address operands) + new string pool
-
-    mode: '' = cp1252 (original ASCII), 'direct' = cp1251 Cyrillic, 'font' = special font
-    """
-    # Read originals with cp1252 (ASCII-safe, works for all source files)
+                 mode:         str = "",
+                 wrapper:      WordWrapper = None) -> bytes:
     src_enc = "shift_jis" if mode == "" else "cp1252"
+    if wrapper is None:
+        wrapper = NoOpWordWrapper()
 
-    pool:      bytearray       = bytearray()
-    pool_seen: dict[bytes, int] = {}  # encoded bytes → absolute file offset
-    new_addrs: dict[int, int]  = {}   # operand_offset → absolute file offset
+    pool:      bytearray        = bytearray()
+    pool_seen: dict[bytes, int] = {}
+    new_addrs: dict[int, int]   = {}
 
     for s in strings:
-        text = translations.get(s.operand_offset,
-                                _read_sz(data, s.text_offset, src_enc))
+        if s.operand_offset in translations:
+            text, sfx = translations[s.operand_offset]
+            
+            # ВООБЩЕ НЕ СМОТРИМ НА ТИП СТРОКИ:
+            # Если строка содержит пробелы и не помещается в лимит ширины — переносим!
+            if len(text) > wrapper.line_width and (' ' in text or '-' in text):
+                text = wrapper.wrap(text, line_break="\n")
+                
+            text = text + sfx
+        else:
+            text = _read_sz(data, s.text_offset, src_enc)
+
         encoded = _encode_sz_mode(text, mode)
         if encoded not in pool_seen:
             abs_off = code_offset + code_length + len(pool)
@@ -508,16 +627,15 @@ def patch_script(data:         bytes,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Excel writing
+# Excel writing / reading
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Колонки: A=# B=Type C=Original D=TL E=TLE F=Sfx G=Offset(hex)
 _COL_HEADERS = ["#", "Type", "Original", "TL", "TLE", "Sfx", "Offset (hex)"]
 _COL_WIDTHS  = [5,   9,       65,          65,   65,    5,     14]
 _HDR_BG, _HDR_FG = "2F5496", "FFFFFF"
 _MSG_BG, _NAME_BG = "FFFFFF", "E2EFDA"
-_TL_BG  = "FFF2CC"   # жёлтый — колонка TL
-_TLE_BG = "FCE4D6"   # оранжевый — колонка TLE (приоритет)
+_TL_BG  = "FFF2CC"
+_TLE_BG = "FCE4D6"
 
 
 def _border() -> Border:
@@ -527,14 +645,12 @@ def _border() -> Border:
 
 def write_xlsx(files: dict[str, tuple[list[ScriptString], bytes, str]],
                out_path: str) -> None:
-    """files = {filename: (strings, raw_data, encoding)}"""
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
     for filename, (strings, data, encoding) in files.items():
         ws = wb.create_sheet(title=filename[:31])
 
-        # Заголовки
         for col, (h, w) in enumerate(zip(_COL_HEADERS, _COL_WIDTHS), 1):
             c = ws.cell(row=1, column=col, value=h)
             c.font      = Font(bold=True, color=_HDR_FG, name="Arial", size=10)
@@ -557,7 +673,6 @@ def write_xlsx(files: dict[str, tuple[list[ScriptString], bytes, str]],
             row  = idx + 1
             bg   = _NAME_BG if s.string_type == "name" else _MSG_BG
 
-            # A=#  B=Type  C=Original  D=TL(пусто)  E=TLE(пусто)  F=Sfx  G=Offset
             row_vals = [idx, s.string_type.capitalize(), text, "", "", sfx, hex(s.operand_offset)]
             row_bgs  = [bg,  bg,                         bg,   _TL_BG, _TLE_BG, bg, bg]
 
@@ -565,8 +680,7 @@ def write_xlsx(files: dict[str, tuple[list[ScriptString], bytes, str]],
                 c = ws.cell(row=row, column=col, value=val)
                 c.font      = Font(name="Arial", size=10)
                 c.fill      = PatternFill("solid", start_color=cell_bg)
-                c.alignment = Alignment(horizontal="left", vertical="top",
-                                        wrap_text=True)
+                c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
                 c.border    = _border()
             idx += 1
 
@@ -574,28 +688,18 @@ def write_xlsx(files: dict[str, tuple[list[ScriptString], bytes, str]],
     print(f"Saved → {out_path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Excel reading
-# ─────────────────────────────────────────────────────────────────────────────
-
-def read_xlsx(xlsx_path: str) -> dict[str, dict[int, str]]:
-    """
-    Читает переводы из Excel.
-    Колонки: A=# B=Type C=Original D=TL E=TLE F=Sfx G=Offset(hex)
-    Приоритет: TLE (E) → TL (D) → пропустить (оставить оригинал).
-    """
+def read_xlsx(xlsx_path: str) -> dict[str, dict[int, tuple[str, str]]]:
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
-    result: dict[str, dict[int, str]] = {}
+    result: dict[str, dict[int, tuple[str, str]]] = {}
     for ws in wb.worksheets:
-        sheet: dict[int, str] = {}
+        sheet: dict[int, tuple[str, str]] = {}
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not row or len(row) < 7:
                 continue
-            # G=col7 → index 6
             offset_val = row[6]
-            tl         = row[3]   # D
-            tle        = row[4]   # E
-            sfx        = row[5]   # F
+            tl         = row[3]
+            tle        = row[4]
+            sfx        = row[5]
             if offset_val is None:
                 continue
             try:
@@ -603,7 +707,6 @@ def read_xlsx(xlsx_path: str) -> dict[str, dict[int, str]]:
             except ValueError:
                 continue
             sfx_str = str(sfx).strip() if sfx is not None else ""
-            # TLE имеет приоритет
             translation = None
             if tle is not None and str(tle).strip():
                 translation = str(tle)
@@ -611,7 +714,7 @@ def read_xlsx(xlsx_path: str) -> dict[str, dict[int, str]]:
                 translation = str(tl)
             if translation is not None:
                 translation = _normalize_punctuation(translation.replace("\\n", "\n"))
-                sheet[offset] = translation + sfx_str
+                sheet[offset] = (translation, sfx_str)
         result[ws.title] = sheet
     wb.close()
     return result
@@ -620,6 +723,7 @@ def read_xlsx(xlsx_path: str) -> dict[str, dict[int, str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
+
 def collect_files(paths: list[str]) -> list[str]:
     result = []
     for p in paths:
@@ -632,8 +736,8 @@ def collect_files(paths: list[str]) -> list[str]:
         else:
             print(f"WARNING: not found: {p}")
     return result
-    
-    
+
+
 def cmd_extract(args) -> None:
     files: dict[str, tuple[list[ScriptString], bytes, str]] = {}
     file_list = collect_files(args.files)
@@ -652,12 +756,28 @@ def cmd_extract(args) -> None:
     write_xlsx(files, args.output)
 
 
+def get_wrapper(args) -> WordWrapper:
+    wrapper_type = args.wrapper.lower()
+    if wrapper_type == "none":
+        return NoOpWordWrapper()
+    elif wrapper_type == "monospace":
+        return MonospaceWordWrapper(characters_per_line=args.line_width or 50)
+    elif wrapper_type == "proportional":
+        return ProportionalWordWrapper(
+            font_name=args.font_name,
+            font_size=args.font_size,
+            bold=args.font_bold,
+            line_width=args.line_width or 1000
+        )
+    else:
+        raise ValueError(f"Unknown wrapper type: {wrapper_type}")
+
+
 def cmd_insert(args) -> None:
     translations_by_file = read_xlsx(args.xlsx)
     os.makedirs(args.output, exist_ok=True)
     file_list = collect_files(args.files)
 
-    # Определяем режим вывода
     if args.RU_C:
         mode = 'direct'
         mode_label = 'RU_C (cp1251 кириллица)'
@@ -668,7 +788,14 @@ def cmd_insert(args) -> None:
         mode = ''
         mode_label = 'ASCII/cp1252'
 
+    wrapper = get_wrapper(args)
     print(f"Режим: {mode_label}")
+    if args.wrapper == "none":
+        print("Перенос строк: отключен")
+    elif args.wrapper == "monospace":
+        print(f"Перенос строк: моноширинный ({wrapper.line_width} символов)")
+    else:
+        print(f"Перенос строк: пропорциональный ({args.font_name} {args.font_size}px, макс {wrapper.line_width}px)")
 
     for filepath in file_list:
         name = os.path.basename(filepath)
@@ -681,14 +808,12 @@ def cmd_insert(args) -> None:
             continue
 
         trans = translations_by_file[sheet_key]
-        patched  = patch_script(data, strings, trans, code_offset, code_length, mode)
+        patched  = patch_script(data, strings, trans, code_offset, code_length, mode, wrapper)
         out_path = os.path.join(args.output, name)
         with open(out_path, "wb") as f:
             f.write(patched)
         print(f"  Patched → {out_path}  ({len(trans)} strings replaced)")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -697,29 +822,33 @@ def main() -> None:
         epilog="""
 Примеры:
   python bgi_tool.py extract scripts/ -o strings.xlsx
-  python bgi_tool.py insert  scripts/ -x strings.xlsx -o patched/         # ASCII
-  python bgi_tool.py insert  scripts/ -x strings.xlsx -o patched/ --RU_C  # прямая кириллица cp1251
-  python bgi_tool.py insert  scripts/ -x strings.xlsx -o patched/ --RU_F  # специализированный шрифт
+  python bgi_tool.py insert  scripts/ -x strings.xlsx -o patched/ --wrapper monospace --line-width 48
+  python bgi_tool.py insert  scripts/ -x strings.xlsx -o patched/ --RU_C --wrapper monospace --line-width 48
+  python bgi_tool.py insert  scripts/ -x strings.xlsx -o patched/ --RU_F --wrapper monospace --line-width 48
 """,
     )
     sub = parser.add_subparsers(dest="command")
 
     p_ext = sub.add_parser("extract", help="Извлечь текст в Excel")
     p_ext.add_argument("files", nargs="+", help="Файлы или папки со скриптами")
-    p_ext.add_argument("-o", "--output", default="strings.xlsx",
-                       help="Выходной .xlsx  [по умолчанию: strings.xlsx]")
+    p_ext.add_argument("-o", "--output", default="strings.xlsx", help="Выходной .xlsx")
 
     p_ins = sub.add_parser("insert", help="Вставить переводы обратно в скрипты")
     p_ins.add_argument("files", nargs="+", help="Оригинальные файлы или папки")
     p_ins.add_argument("-x", "--xlsx", required=True, help="Excel с переводами")
-    p_ins.add_argument("-o", "--output", default="output",
-                       help="Выходная папка  [по умолчанию: output/]")
+    p_ins.add_argument("-o", "--output", default="output", help="Выходная папка")
 
     mode_group = p_ins.add_mutually_exclusive_group()
-    mode_group.add_argument("--RU_C", action="store_true",
-                            help="Прямой вывод кириллицы (cp1251)")
-    mode_group.add_argument("--RU_F", action="store_true",
-                            help="Специализированный шрифт (A=А, B=Б, ... + спецсимволы)")
+    mode_group.add_argument("--RU_C", action="store_true", help="Прямой вывод кириллицы (cp1251)")
+    mode_group.add_argument("--RU_F", action="store_true", help="Специализированный шрифт")
+
+    p_ins.add_argument("--wrapper", choices=["monospace", "proportional", "none"], default="monospace",
+                       help="Алгоритм переноса (по умолчанию: monospace)")
+    p_ins.add_argument("--line-width", type=int, default=None,
+                       help="Ширина строки: символов для monospace (по умолчанию 50), пикселей для proportional (по умолчанию 1000)")
+    p_ins.add_argument("--font-name", default="Franklin Gothic Book", help="Имя шрифта для proportional")
+    p_ins.add_argument("--font-size", type=int, default=40, help="Размер шрифта для proportional")
+    p_ins.add_argument("--font-bold", action="store_true", help="Жирный шрифт для proportional")
 
     args = parser.parse_args()
     if args.command == "extract":
