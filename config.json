@@ -20,14 +20,14 @@
 
     "character_substitution": {
       "enable": true,
-      "source_characters": "><+%=#*",
-      "target_characters": "ÓÕ¹²×É*"
+      "source_characters": "><+%#",
+      "target_characters": "ÓÕ¹²É"
     },
 
     "font_manager": {
       "enable": true,
       "resource_files": [
-        "YasuSakuutaSuika.ttf"
+        "OUCTSfontD1.ttf"
       ],
       "spoof_enumeration": {
         "enable": true,
@@ -37,7 +37,7 @@
       },
       "spoof_creation": {
         "enable": true,
-        "override_face": "YasuSakuutaSuika",
+        "override_face": "OUCTSfontD1",
         "override_charset": 0
       }
     },
