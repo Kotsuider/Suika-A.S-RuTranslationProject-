@@ -395,7 +395,7 @@ for _l, _c in _RU_F_LOWER.items():
 _RU_F_CYR_TO_BYTES.update({
     'Ъ': b'[',    'Ь': b']',    'ё': b'`',
     'э': b'{',    'ы': b'|',    'я': b'}',
-    'Ы': b'\xa1',
+    'Ы': b'^',
     'ь': b'&',
     'ъ': b'+',
     'Ю': b'%',
@@ -407,7 +407,8 @@ _RU_F_CYR_TO_BYTES.update({
     'Й': b'J',    'й': b'j',
     '«': b'"',
     '»': b'"',
-    '*': b'*',
+    '„': b'\'',
+    '“': b'\'',
 })
 
 
@@ -606,6 +607,10 @@ def patch_script(data:         bytes,
             if len(text) > wrapper.line_width and (' ' in text or '-' in text):
                 text = wrapper.wrap(text, line_break="\n")
                 
+            # @ continues the next message in the same text window.
+            # Preserve an existing separator; add exactly one space if absent.
+            if sfx == "@" and text and not text.endswith(" "):
+                text += " "
             text = text + sfx
         else:
             text = _read_sz(data, s.text_offset, src_enc)
