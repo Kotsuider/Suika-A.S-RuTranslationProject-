@@ -7,16 +7,14 @@
 ## Статус
 
 **Progress:**
-`[███████████░░░░░░░░] 60%`
+`[▩▩▩▩▩▩▩▩▩▩▩▩▩▩▩▩▩▩▢▢] 90%`
 
-- [x] Хук скриптов
-- [x] Хук изображений
+
 - [x] Полный перевод
-- [ ] Перевод системного текста
-- [ ] Перевод графики
-- [ ] Редактура
+- [x] Перевод графики
+- [x] Редактура
+- [ ] Вычитка (1 глава из 4-х)
 
-[Таблица с переводом](https://docs.google.com/spreadsheets/d/1ys3aVklQtuviDvpHG_Xnj22VTMZUeDSb/edit?usp=sharing&ouid=103224880279791937700&rtpof=true&sd=true) 
 
 
 ## Установка
@@ -26,10 +24,3 @@
 
 ## Редактирование патча
 Достаём скрипты через [GARbro](https://github.com/morkt/GARbro/releases/tag/v1.5.44) из data01000.
-
-Получаем распакованные папки, нам нужна script. 
-Качаем xlsx.
-
-```
-python bgi_tool.py insert  scripts/ -x suika.xlsx -o patched/ --RU_F
-```

@@ -34,6 +34,7 @@ from openpyxl.utils import get_column_letter
 
 LINE_BREAK_CHARS = (' ', '-')
 CJK_PUNCTUATION = "，。？！」』】）’”"
+FORMAT_TAG_RE = re.compile(r"</?(?:i|b|u)>", re.IGNORECASE)
 
 
 class WordWrapper(ABC):
@@ -45,6 +46,10 @@ class WordWrapper(ABC):
     @abstractmethod
     def line_width(self) -> int:
         pass
+
+    def _get_visible_width(self, text: str, offset: int, length: int) -> int:
+        visible = FORMAT_TAG_RE.sub("", text[offset:offset + length])
+        return self.get_text_width(visible, 0, len(visible))
 
     def get_wrap_positions(self, text: str) -> list[int]:
         positions: list[int] = []
@@ -66,7 +71,7 @@ class WordWrapper(ABC):
                 else:
                     search_pos = n
 
-                if self.get_text_width(text, line_start_pos, search_pos - line_start_pos) > self.line_width:
+                if self._get_visible_width(text, line_start_pos, search_pos - line_start_pos) > self.line_width:
                     break
 
                 line_end_pos = search_pos
@@ -74,8 +79,10 @@ class WordWrapper(ABC):
             if line_end_pos == line_start_pos:
                 search_pos = line_end_pos
                 while line_end_pos < n:
-                    search_pos += 1
-                    if self.get_text_width(text, line_start_pos, search_pos - line_start_pos) > self.line_width:
+                    # Formatting tags are atomic and have no visible width.
+                    tag = FORMAT_TAG_RE.match(text, search_pos)
+                    search_pos = tag.end() if tag else search_pos + 1
+                    if self._get_visible_width(text, line_start_pos, search_pos - line_start_pos) > self.line_width:
                         break
                     line_end_pos = search_pos
 
@@ -407,7 +414,7 @@ _RU_F_CYR_TO_BYTES.update({
     'Й': b'J',    'й': b'j',
     '«': b'"',
     '»': b'"',
-    '„': b'\'',
+    '„': b'\'', '“': b'\'', '”': b'\'',
     '“': b'\'',
 })
 
@@ -589,7 +596,8 @@ def patch_script(data:         bytes,
                  code_offset:  int,
                  code_length:  int,
                  mode:         str = "",
-                 wrapper:      WordWrapper = None) -> bytes:
+                 wrapper:      WordWrapper = None,
+                 ignore_at:    bool = False) -> bytes:
     src_enc = "shift_jis" if mode == "" else "cp1252"
     if wrapper is None:
         wrapper = NoOpWordWrapper()
@@ -602,11 +610,15 @@ def patch_script(data:         bytes,
         if s.operand_offset in translations:
             text, sfx = translations[s.operand_offset]
             
-            # ВООБЩЕ НЕ СМОТРИМ НА ТИП СТРОКИ:
-            # Если строка содержит пробелы и не помещается в лимит ширины — переносим!
-            if len(text) > wrapper.line_width and (' ' in text or '-' in text):
+            if ignore_at and s.string_type != "internal":
+                text = text.replace("@", "")
+                sfx = sfx.replace("@", "")
+
+            # Let the wrapper measure visible text, excluding formatting tags.
+            # Explicit newlines from the translation remain hard line breaks.
+            if ' ' in text or '-' in text:
                 text = wrapper.wrap(text, line_break="\n")
-                
+
             # @ continues the next message in the same text window.
             # Preserve an existing separator; add exactly one space if absent.
             if sfx == "@" and text and not text.endswith(" "):
@@ -614,6 +626,8 @@ def patch_script(data:         bytes,
             text = text + sfx
         else:
             text = _read_sz(data, s.text_offset, src_enc)
+            if ignore_at and s.string_type != "internal":
+                text = text.replace("@", "")
 
         encoded = _encode_sz_mode(text, mode)
         if encoded not in pool_seen:
@@ -795,6 +809,7 @@ def cmd_insert(args) -> None:
 
     wrapper = get_wrapper(args)
     print(f"Режим: {mode_label}")
+    print("Продолжение @: " + ("игнорируется" if args.ignore_at else "сохраняется"))
     if args.wrapper == "none":
         print("Перенос строк: отключен")
     elif args.wrapper == "monospace":
@@ -813,7 +828,8 @@ def cmd_insert(args) -> None:
             continue
 
         trans = translations_by_file[sheet_key]
-        patched  = patch_script(data, strings, trans, code_offset, code_length, mode, wrapper)
+        patched  = patch_script(data, strings, trans, code_offset, code_length, mode, wrapper,
+                                ignore_at=args.ignore_at)
         out_path = os.path.join(args.output, name)
         with open(out_path, "wb") as f:
             f.write(patched)
@@ -830,6 +846,7 @@ def main() -> None:
   python bgi_tool.py insert  scripts/ -x strings.xlsx -o patched/ --wrapper monospace --line-width 48
   python bgi_tool.py insert  scripts/ -x strings.xlsx -o patched/ --RU_C --wrapper monospace --line-width 48
   python bgi_tool.py insert  scripts/ -x strings.xlsx -o patched/ --RU_F --wrapper monospace --line-width 48
+  python bgi_tool.py insert  scripts/ -x strings.xlsx -o patched/ --RU_F --ignore-at --line-width 52
 """,
     )
     sub = parser.add_subparsers(dest="command")
@@ -854,6 +871,8 @@ def main() -> None:
     p_ins.add_argument("--font-name", default="Franklin Gothic Book", help="Имя шрифта для proportional")
     p_ins.add_argument("--font-size", type=int, default=40, help="Размер шрифта для proportional")
     p_ins.add_argument("--font-bold", action="store_true", help="Жирный шрифт для proportional")
+    p_ins.add_argument("--ignore-at", action="store_true",
+                       help="Не вставлять управляющий @ из текста и Sfx; также убрать @ из непереведённых видимых строк")
 
     args = parser.parse_args()
     if args.command == "extract":
